@@ -68,9 +68,10 @@ def speech_bounds(src, thr="-38dB"):
     b = starts[-1] if starts and (len(ends) < len(starts) or ends[-1] >= dur - 0.15) else dur
     return max(0, a - 0.25), min(dur, b + 0.3)
 
-def clean_audio(src, dst, extra_af=""):
+def clean_audio(src, dst, extra_af="", tts=False):
     a, b = speech_bounds(src)
-    af = "highpass=f=80,afftdn=nf=-25,agate=threshold=0.015:ratio=2.5:attack=5:release=150," + (extra_af + "," if extra_af else "") + "loudnorm=I=-16:TP=-1.5:LRA=11"
+    base = "highpass=f=80," if tts else "highpass=f=80,afftdn=nf=-25,agate=threshold=0.015:ratio=2.5:attack=5:release=150,"
+    af = base + (extra_af + "," if extra_af else "") + "loudnorm=I=-16:TP=-1.5:LRA=11"
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{a:.2f}", "-to", f"{b:.2f}", "-i", src,
                     "-ac", "1", "-ar", "44100", "-af", af, dst], check=True)
 
@@ -171,6 +172,39 @@ def subtitle_timeline(env, text, tol=0.7):
         merged[k][1] = merged[k + 1][0] if k + 1 < len(merged) else segs[-1][1] + 6
     return [tuple(x) for x in merged]
 
+def subs_from_words(words, offset=0.0, tempo=1.0, max_chars=24):
+    """words: [[texto, inicio, fin], ...] en segundos del audio original.
+    Agrupa por oración y la parte en trozos parejos (sin palabras sueltas al final)."""
+    W2 = [(w, (a - offset) / tempo, (b - offset) / tempo) for w, a, b in words]
+    sents, cur = [], []
+    for it in W2:
+        cur.append(it)
+        if it[0].endswith((".", "?", "!")):
+            sents.append(cur); cur = []
+    if cur: sents.append(cur)
+    out = []
+    for sw in sents:
+        total = len(" ".join(w for w, _, _ in sw))
+        n = max(1, math.ceil(total / max_chars))
+        target = total / n
+        part, plen = [], 0
+        for i, it in enumerate(sw):
+            part.append(it); plen += len(it[0]) + 1
+            remaining = len(sw) - i - 1
+            if remaining and len(out) >= 0 and (plen >= target * 0.92 or it[0].endswith(",") and plen >= target * 0.6):
+                out.append(part); part, plen = [], 0
+        if part:
+            if out and len(" ".join(w for w, _, _ in part)) <= 8 and len(" ".join(w for w, _, _ in out[-1] + part)) <= max_chars + 8:
+                out[-1] += part
+            else:
+                out.append(part)
+    res = []
+    for k, p in enumerate(out):
+        a, b = p[0][1], p[-1][2]
+        nxt = out[k + 1][0][1] if k + 1 < len(out) else b + 0.4
+        res.append((int(round(a * FPS)), int(round(min(nxt, b + 0.6) * FPS)), " ".join(w for w, _, _ in p)))
+    return res
+
 def render(out, env, dur, titulo, subs, audio_wav=None, categoria="CONOCE LA CARRERA"):
     tmp = tempfile.mkdtemp()
     S = sprites(tmp)
@@ -240,6 +274,8 @@ if __name__ == "__main__":
     ap.add_argument("--categoria", default="CONOCE LA CARRERA")
     ap.add_argument("--out", required=True); ap.add_argument("--preview", action="store_true")
     ap.add_argument("--voz_personaje", action="store_true", help="sube el tono para que suene a personaje")
+    ap.add_argument("--tts", action="store_true", help="audio ya limpio (ElevenLabs): sin reducción de ruido")
+    ap.add_argument("--palabras", help="JSON [[palabra, inicio, fin], ...] para subtítulos exactos")
     a = ap.parse_args()
     if a.preview:
         rng = np.random.default_rng(7)
@@ -252,8 +288,15 @@ if __name__ == "__main__":
         render(a.out, env, n / FPS, a.titulo, subtitle_timeline(env, text), None, a.categoria)
     else:
         wav = a.out + ".voz.wav"
-        clean_audio(a.audio, wav, "rubberband=pitch=1.25:tempo=1.04:window=short:pitchq=quality" if a.voz_personaje else "")
+        tempo = 1.04 if a.voz_personaje else 1.0
+        clean_audio(a.audio, wav, "rubberband=pitch=1.25:tempo=1.04:window=short:pitchq=quality" if a.voz_personaje else "", tts=a.tts)
         env, dur = envelope(wav)
-        text = open(a.guion, encoding="utf-8").read().strip()
-        render(a.out, env, dur, a.titulo, subtitle_timeline(env, text), wav, a.categoria)
+        if a.palabras:
+            import json
+            off = speech_bounds(a.audio)[0]
+            subs = subs_from_words(json.load(open(a.palabras, encoding="utf-8")), off, tempo)
+        else:
+            text = open(a.guion, encoding="utf-8").read().strip()
+            subs = subtitle_timeline(env, text)
+        render(a.out, env, dur, a.titulo, subs, wav, a.categoria)
         os.remove(wav)

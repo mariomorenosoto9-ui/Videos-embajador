@@ -57,11 +57,22 @@ def wrap(text, font, maxw, d):
     if cur: lines.append(cur)
     return lines
 
-def clean_audio(src, dst):
-    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-ac", "1", "-ar", "44100",
-                    "-af", "highpass=f=80,afftdn=nf=-25,silenceremove=start_periods=1:start_threshold=-45dB,"
-                           "areverse,silenceremove=start_periods=1:start_threshold=-45dB,areverse,"
-                           "loudnorm=I=-16:TP=-1.5:LRA=11", dst], check=True)
+def speech_bounds(src, thr="-38dB"):
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-i", src, "-af", f"silencedetect=n={thr}:d=0.35", "-f", "null", "-"],
+                       capture_output=True, text=True).stderr
+    import re
+    starts = [float(x) for x in re.findall(r"silence_start: ([0-9.]+)", r)]
+    ends = [float(x) for x in re.findall(r"silence_end: ([0-9.]+)", r)]
+    dur = float(re.findall(r"Duration: (\d+):(\d+):([0-9.]+)", r)[0][2]) + 60 * float(re.findall(r"Duration: (\d+):(\d+):([0-9.]+)", r)[0][1])
+    a = ends[0] if starts and starts[0] < 0.05 and ends else 0.0
+    b = starts[-1] if starts and (len(ends) < len(starts) or ends[-1] >= dur - 0.15) else dur
+    return max(0, a - 0.25), min(dur, b + 0.3)
+
+def clean_audio(src, dst, extra_af=""):
+    a, b = speech_bounds(src)
+    af = "highpass=f=80,afftdn=nf=-25,agate=threshold=0.015:ratio=2.5:attack=5:release=150," + (extra_af + "," if extra_af else "") + "loudnorm=I=-16:TP=-1.5:LRA=11"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{a:.2f}", "-to", f"{b:.2f}", "-i", src,
+                    "-ac", "1", "-ar", "44100", "-af", af, dst], check=True)
 
 def envelope(wav_path, nframes=None):
     with wave.open(wav_path) as w:
@@ -86,15 +97,79 @@ def chunks(text, max_chars=26):
     if cur: out.append(cur)
     return out
 
-def subtitle_timeline(env, text):
-    voiced = env > 0.12
-    idx = np.where(voiced)[0]
-    if len(idx) == 0: return []
-    t0, t1 = idx[0], idx[-1] + 1
-    parts = chunks(text)
-    weights = np.array([len(p) for p in parts], float); weights /= weights.sum()
-    bounds = t0 + np.concatenate([[0], np.cumsum(weights)]) * (t1 - t0)
-    return [(int(bounds[i]), int(bounds[i + 1]), parts[i]) for i in range(len(parts))]
+def voiced_segments(env, thr=0.12, min_sil=9):
+    v = env > thr
+    segs, i, n = [], 0, len(v)
+    while i < n:
+        if v[i]:
+            j = i
+            while j < n and (v[j] or (j + 1 < n and not v[j] and np.any(v[j:j + min_sil]))): j += 1
+            segs.append((i, j)); i = j
+        else:
+            i += 1
+    return [s for s in segs if s[1] - s[0] >= 4]
+
+def units(text):
+    import re
+    return [u.strip() for u in re.findall(r"[^.,?!]+[.,?!]*", text) if u.strip()]
+
+def sentences(text):
+    import re
+    return [x.strip() for x in re.findall(r"[^.?!]+[.?!]+", text) if x.strip()]
+
+def subtitle_timeline(env, text, tol=0.7):
+    """Si cada oración viene separada por una pausa clara, las empareja una a una.
+    Si no, reparte el guion sobre el tiempo con voz y ajusta cada fin de frase a la pausa más cercana."""
+    sents = sentences(text)
+    big = voiced_segments(env, min_sil=18)
+    if len(sents) > 1 and len(big) == len(sents):
+        out = []
+        for (a, b), sent in zip(big, sents):
+            parts = chunks(sent)
+            w = np.array([len(p) for p in parts], float); cum = np.concatenate([[0], np.cumsum(w)]) / w.sum()
+            for k, p in enumerate(parts):
+                out.append([int(a + cum[k] * (b - a)), int(a + cum[k + 1] * (b - a)), p])
+        for k in range(len(out) - 1):
+            out[k][1] = max(out[k][1], out[k + 1][0])
+        return [tuple(x) for x in out]
+    segs = voiced_segments(env)
+    if not segs: return []
+    us = units(text)
+    durs = [b - a for a, b in segs]
+    V = float(sum(durs))
+    gaps = list(np.cumsum(durs)[:-1])  # posiciones (en tiempo con voz) de cada pausa
+    def v2t(x):
+        acc = 0
+        for (a, b), d in zip(segs, durs):
+            if x <= acc + d: return a + (x - acc)
+            acc += d
+        return segs[-1][1]
+    lens = np.array([len(u) for u in us], float)
+    xs = list(np.concatenate([[0], np.cumsum(lens)]) / lens.sum() * V)
+    used = set()
+    for k in range(1, len(xs) - 1):
+        if gaps and us[k - 1].endswith((".", "?", "!")):
+            j = int(np.argmin([abs(g - xs[k]) for g in gaps]))
+            if abs(gaps[j] - xs[k]) <= tol * FPS and j not in used and gaps[j] > xs[k - 1]:
+                xs[k] = gaps[j]; used.add(j)
+    out = []
+    for k, u in enumerate(us):
+        parts = chunks(u) if len(u) > 26 else [u]
+        w = np.array([len(p) for p in parts], float); cum = np.concatenate([[0], np.cumsum(w)]) / w.sum()
+        for i, p in enumerate(parts):
+            x0 = xs[k] + cum[i] * (xs[k + 1] - xs[k])
+            out.append([int(v2t(x0 + 0.01)), 0, p])
+    # fusiona trozos muy cortos (< 0.5 s) con el siguiente
+    merged = []
+    for k, it in enumerate(out):
+        nxt = out[k + 1][0] if k + 1 < len(out) else segs[-1][1] + 6
+        if merged and nxt - it[0] < 15 and len(merged[-1][2]) + len(it[2]) <= 30:
+            merged[-1][2] += " " + it[2]
+        else:
+            merged.append(it)
+    for k in range(len(merged)):
+        merged[k][1] = merged[k + 1][0] if k + 1 < len(merged) else segs[-1][1] + 6
+    return [tuple(x) for x in merged]
 
 def render(out, env, dur, titulo, subs, audio_wav=None, categoria="CONOCE LA CARRERA"):
     tmp = tempfile.mkdtemp()
@@ -164,6 +239,7 @@ if __name__ == "__main__":
     ap.add_argument("--audio"); ap.add_argument("--guion"); ap.add_argument("--titulo", default="Administración de Empresas")
     ap.add_argument("--categoria", default="CONOCE LA CARRERA")
     ap.add_argument("--out", required=True); ap.add_argument("--preview", action="store_true")
+    ap.add_argument("--voz_personaje", action="store_true", help="sube el tono para que suene a personaje")
     a = ap.parse_args()
     if a.preview:
         rng = np.random.default_rng(7)
@@ -176,7 +252,7 @@ if __name__ == "__main__":
         render(a.out, env, n / FPS, a.titulo, subtitle_timeline(env, text), None, a.categoria)
     else:
         wav = a.out + ".voz.wav"
-        clean_audio(a.audio, wav)
+        clean_audio(a.audio, wav, "rubberband=pitch=1.25:tempo=1.04:window=short:pitchq=quality" if a.voz_personaje else "")
         env, dur = envelope(wav)
         text = open(a.guion, encoding="utf-8").read().strip()
         render(a.out, env, dur, a.titulo, subtitle_timeline(env, text), wav, a.categoria)
